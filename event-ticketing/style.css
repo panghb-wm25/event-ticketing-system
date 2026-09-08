@@ -2,7 +2,7 @@
   color-scheme: light;
 
   --accent: #643ff9;
-  --accent-dark: #5c2d72;
+  --accent-dark: #643ff9;
   --accent-soft: #f3ecf7;
   --bg: #f6f5f8;
   --surface: #ffffff;
@@ -27,8 +27,8 @@
   :root:not([data-theme="light"]) {
     color-scheme: dark;
 
-    --accent: #b57ecf;
-    --accent-dark: #9a5fb5;
+    --accent: #643ff9;
+    --accent-dark: #643ff9;
     --accent-soft: #352b3c;
     --bg: #17141a;
     --surface: #211d27;
