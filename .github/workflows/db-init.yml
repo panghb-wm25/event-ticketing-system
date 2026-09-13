@@ -1,18 +1,21 @@
 name: DB - Seed Database (one-time)
 
-# Manual trigger only. Safe to accidentally run more than once - infra/scripts/
-# seed-db.sh checks whether event_ticketing_db.users already exists and skips
-# the import if so, rather than failing on duplicate-key errors from
-# schema.sql's seed INSERTs.
+# Manual trigger only.
 #
-# Runs seed-db.sh *on* a running app instance via SSM Run Command, rather than
-# connecting to RDS directly from the GitHub-hosted runner. RDS has no public
-# ingress rule on 3306 - AWS Academy auto-revokes 0.0.0.0/0:3306 rules within
-# seconds of creation, so a publicly-reachable DB isn't a workable path on
-# this account. The app instances already sit in sg-ec2, which sg-rds trusts,
-# and already have the mysql client (mariadb105) and SSM/LabRole access via
-# user_data.sh.tftpl, so no new infrastructure is needed - this workflow just
-# needed to actually use the SSM path instead of connecting directly.
+# Does NOT use SSM Send-Command to run mysql on an existing instance - AWS
+# Academy's LabRole generally can't register instances as SSM Managed
+# Instances, so that approach fails with InvalidInstanceId even though other
+# SSM calls (get-parameter) work fine from the instance's own role.
+#
+# Instead: the seeding logic lives in user_data.sh.tftpl and runs on instance
+# boot, guarded by an S3 marker so it's a no-op after the first successful
+# run. This job uploads schema.sql, forces one ASG instance to relaunch (which
+# re-runs user_data.sh), then polls S3 for the marker to confirm it worked.
+#
+# Heads up: this briefly takes the app below its normal capacity while the
+# replacement instance boots (dnf update + package installs + seed, typically
+# a few minutes) - fine for a one-time coursework seed, not something to run
+# repeatedly against a "live" demo without expecting a short dip.
 on:
   workflow_dispatch: {}
 
@@ -21,11 +24,12 @@ env:
   APP_TAG: assignment-event-ticketing
   ASG_NAME: assignment-asg
   SCHEMA_KEY: db-init/schema.sql
-  SCRIPT_KEY: db-init/seed-db.sh
+  SEED_MARKER_KEY: db-init/.seeded
+  POLL_TIMEOUT_SECONDS: 480
 
 jobs:
   seed:
-    name: Seed RDS from schema.sql via SSM
+    name: Force a relaunch to seed RDS via user_data
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -54,75 +58,73 @@ jobs:
           terraform init -input=false
           echo "SCHEMA_BUCKET=$(terraform output -raw s3_bucket_name)" >> "$GITHUB_ENV"
 
-      - name: Upload schema.sql, seed script, and sample images to S3
+      - name: Clear any stale seed marker
+        run: |
+          aws s3 rm "s3://${{ env.SCHEMA_BUCKET }}/${{ env.SEED_MARKER_KEY }}" 2>/dev/null || true
+
+      - name: Upload schema.sql and sample images to S3
         run: |
           aws s3 cp event-ticketing/schema.sql "s3://${{ env.SCHEMA_BUCKET }}/${{ env.SCHEMA_KEY }}"
-          aws s3 cp infra/scripts/seed-db.sh "s3://${{ env.SCHEMA_BUCKET }}/${{ env.SCRIPT_KEY }}"
           aws s3 sync event-ticketing/uploads/ "s3://${{ env.SCHEMA_BUCKET }}/uploads/" \
             --exclude "index.html"
 
-      - name: Resolve a running app instance from the ASG
+      - name: Identify current instance and force a relaunch
         run: |
           set -euo pipefail
-          INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
+
+          OLD_ID=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "${{ env.ASG_NAME }}" \
             --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`]|[0].InstanceId' \
             --output text)
 
-          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+          if [ -z "$OLD_ID" ] || [ "$OLD_ID" == "None" ]; then
             echo "No InService instance found in ${{ env.ASG_NAME }}. Is the ASG scaled up and healthy?" >&2
             exit 1
           fi
 
-          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
-          echo "Targeting instance $INSTANCE_ID"
+          echo "Current instance: $OLD_ID - terminating so the ASG launches a replacement running the updated user_data."
+          aws autoscaling terminate-instance-in-auto-scaling-group \
+            --instance-id "$OLD_ID" \
+            --no-should-decrement-desired-capacity
 
-      - name: Run seed-db.sh on the instance via SSM
+          echo "OLD_ID=$OLD_ID" >> "$GITHUB_ENV"
+
+      - name: Wait for the replacement instance to be healthy
         run: |
           set -euo pipefail
+          DEADLINE=$((SECONDS + ${{ env.POLL_TIMEOUT_SECONDS }}))
 
-          SCHEMA_URI="s3://${{ env.SCHEMA_BUCKET }}/${{ env.SCHEMA_KEY }}"
-          SCRIPT_URI="s3://${{ env.SCHEMA_BUCKET }}/${{ env.SCRIPT_KEY }}"
+          while [ $SECONDS -lt $DEADLINE ]; do
+            NEW_ID=$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "${{ env.ASG_NAME }}" \
+              --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService' && InstanceId!='${OLD_ID}']|[0].InstanceId" \
+              --output text)
 
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --comment "db-init: seed event_ticketing_db from schema.sql" \
-            --parameters "{\"commands\":[\
-              \"aws s3 cp '$SCRIPT_URI' /tmp/seed-db.sh --region ${{ env.AWS_REGION }}\",\
-              \"chmod +x /tmp/seed-db.sh\",\
-              \"AWS_REGION=${{ env.AWS_REGION }} /tmp/seed-db.sh '$SCHEMA_URI' '${{ env.SCHEMA_BUCKET }}'\"\
-            ]}" \
-            --query "Command.CommandId" --output text)
-
-          echo "SSM command $COMMAND_ID dispatched to $INSTANCE_ID, waiting for result..."
-
-          STATUS="Pending"
-          for i in $(seq 1 30); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text 2>/dev/null || echo "Pending")
-
-            if [ "$STATUS" != "Pending" ] && [ "$STATUS" != "InProgress" ]; then
-              break
+            if [ -n "$NEW_ID" ] && [ "$NEW_ID" != "None" ]; then
+              echo "Replacement instance $NEW_ID is InService."
+              exit 0
             fi
-            sleep 3
+
+            echo "Waiting for replacement instance..."
+            sleep 10
           done
 
-          echo "Final status: $STATUS"
-          echo "--- stdout ---"
-          aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardOutputContent" --output text
-          echo "--- stderr ---"
-          aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" --output text
+          echo "Timed out waiting for a new InService instance." >&2
+          exit 1
 
-          if [ "$STATUS" != "Success" ]; then
-            echo "SSM command did not succeed (status: $STATUS)." >&2
-            exit 1
-          fi
+      - name: Poll S3 for the seed-complete marker
+        run: |
+          set -euo pipefail
+          DEADLINE=$((SECONDS + ${{ env.POLL_TIMEOUT_SECONDS }}))
+
+          while [ $SECONDS -lt $DEADLINE ]; do
+            if aws s3api head-object --bucket "${{ env.SCHEMA_BUCKET }}" --key "${{ env.SEED_MARKER_KEY }}" >/dev/null 2>&1; then
+              echo "Seed marker found - database seeded successfully."
+              exit 0
+            fi
+            echo "Waiting for seed marker..."
+            sleep 10
+          done
+
+          echo "Timed out waiting for the seed marker. The instance may still be booting (dnf update can be slow), or the seed step failed - check /var/log/cloud-init-output.log on the instance via the EC2 console (Instance Connect) or CloudWatch if configured." >&2
+          exit 1

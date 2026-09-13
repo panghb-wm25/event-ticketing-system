@@ -48,3 +48,45 @@ fi
 
 systemctl enable httpd
 systemctl restart httpd
+
+# One-time DB schema seed. Runs here (not via SSM Run Command from CI) because
+# AWS Academy's LabRole generally can't register instances as SSM Managed
+# Instances, so send-command targeting fails with InvalidInstanceId even
+# though the agent's own outbound API calls (s3, ssm get-parameter, both used
+# above) work fine. This reuses that same already-working path instead.
+#
+# Guarded by an S3 marker + a DB-side check so it's a safe no-op on every
+# later launch (scale-out, instance refresh, etc.), and wrapped so a seeding
+# failure can never take down httpd/healthz - db-init.yml confirms success by
+# polling for the marker object rather than by this script's exit code.
+(
+  set +e
+  SEED_MARKER_KEY="db-init/.seeded"
+  SCHEMA_KEY="db-init/schema.sql"
+
+  if ! aws s3api head-object --bucket "${artifact_bucket}" --key "$SEED_MARKER_KEY" --region "${aws_region}" >/dev/null 2>&1; then
+    ALREADY_SEEDED=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" -N -e \
+      "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$DB_NAME' AND table_name='users'" 2>/dev/null)
+    ALREADY_SEEDED="$${ALREADY_SEEDED:-0}"
+
+    if [ "$ALREADY_SEEDED" -eq 0 ] 2>/dev/null; then
+      aws s3 cp "s3://${artifact_bucket}/$SCHEMA_KEY" /tmp/schema.sql --region "${aws_region}" \
+        && mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < /tmp/schema.sql \
+        && echo "Database seeded from $SCHEMA_KEY."
+
+      S3_PREFIX="https://${artifact_bucket}.s3.${aws_region}.amazonaws.com/uploads/"
+      mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -e \
+        "UPDATE events SET image_url = REPLACE(image_url, '/uploads/', '$S3_PREFIX') WHERE image_url LIKE '/uploads/%';"
+    fi
+
+    # Only mark done once we've confirmed the table actually exists now -
+    # covers both "we just seeded it" and "it turns out it already existed".
+    STILL_CHECK=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" -N -e \
+      "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$DB_NAME' AND table_name='users'" 2>/dev/null)
+    if [ "$${STILL_CHECK:-0}" -gt 0 ] 2>/dev/null; then
+      aws s3api put-object --bucket "${artifact_bucket}" --key "$SEED_MARKER_KEY" --region "${aws_region}" >/dev/null 2>&1
+    else
+      echo "DB seed check failed - not writing marker, db-init.yml will time out and this will retry on the next relaunch." >&2
+    fi
+  fi
+) || true
