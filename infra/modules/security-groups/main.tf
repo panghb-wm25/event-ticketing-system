@@ -61,9 +61,11 @@ resource "aws_security_group" "ec2" {
   }
 }
 
-# assignment-sg-rds: the database should only accept traffic from the app
-# instances by default; the GitHub-hosted runner path uses a separate ingress
-# rule so Terraform can add the public access without forcing SG replacement.
+# assignment-sg-rds: the database only accepts traffic from the app instances.
+# db-init.yml seeds the schema by running mysql *on* an app instance via SSM
+# (see .github/workflows/db-init.yml), not from the GitHub-hosted runner, so
+# there is no need for a public 0.0.0.0/0:3306 rule here - AWS Academy auto-
+# revokes those within seconds via an account-level guardrail anyway.
 resource "aws_security_group" "rds" {
   name        = "${var.name_prefix}-sg-rds"
   description = "Allow MySQL/Aurora only from application instances"
@@ -87,13 +89,4 @@ resource "aws_security_group" "rds" {
   tags = {
     Name = "${var.name_prefix}-sg-rds"
   }
-}
-
-resource "aws_vpc_security_group_ingress_rule" "rds_public" {
-  security_group_id = aws_security_group.rds.id
-  cidr_ipv4         = "0.0.0.0/0"
-  from_port         = 3306
-  ip_protocol       = "tcp"
-  to_port           = 3306
-  description       = "MySQL/Aurora from the public internet"
 }

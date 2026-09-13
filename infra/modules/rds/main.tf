@@ -26,8 +26,10 @@ resource "aws_db_instance" "this" {
   db_subnet_group_name   = aws_db_subnet_group.this.name
   vpc_security_group_ids = [var.rds_sg_id]
 
-  multi_az            = false
-  publicly_accessible = true
+  multi_az = false
+  # No longer needs to be public - db-init.yml seeds the schema by running
+  # mysql on an app instance via SSM, over the existing sg-ec2 -> sg-rds path.
+  publicly_accessible = false
 
   # Sandbox environment: prioritize cheap/disposable over durability.
   skip_final_snapshot     = true

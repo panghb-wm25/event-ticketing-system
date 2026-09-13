@@ -1,21 +1,31 @@
 name: DB - Seed Database (one-time)
 
-# Manual trigger only. Safe to accidentally run more than once - the seed
-# script checks whether event_ticketing_db.users already exists and skips the
-# import if so, rather than failing on duplicate-key errors from schema.sql's
-# seed INSERTs.
+# Manual trigger only. Safe to accidentally run more than once - infra/scripts/
+# seed-db.sh checks whether event_ticketing_db.users already exists and skips
+# the import if so, rather than failing on duplicate-key errors from
+# schema.sql's seed INSERTs.
+#
+# Runs seed-db.sh *on* a running app instance via SSM Run Command, rather than
+# connecting to RDS directly from the GitHub-hosted runner. RDS has no public
+# ingress rule on 3306 - AWS Academy auto-revokes 0.0.0.0/0:3306 rules within
+# seconds of creation, so a publicly-reachable DB isn't a workable path on
+# this account. The app instances already sit in sg-ec2, which sg-rds trusts,
+# and already have the mysql client (mariadb105) and SSM/LabRole access via
+# user_data.sh.tftpl, so no new infrastructure is needed - this workflow just
+# needed to actually use the SSM path instead of connecting directly.
 on:
   workflow_dispatch: {}
 
 env:
   AWS_REGION: us-east-1
   APP_TAG: assignment-event-ticketing
+  ASG_NAME: assignment-asg
   SCHEMA_KEY: db-init/schema.sql
   SCRIPT_KEY: db-init/seed-db.sh
 
 jobs:
   seed:
-    name: Seed RDS from schema.sql
+    name: Seed RDS from schema.sql via SSM
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -31,18 +41,17 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Resolve the bucket name from Terraform state rather than hardcoding it,
-      # so it stays in sync with the account-ID-suffixed name Terraform created.
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.0"
 
-      - name: Resolve RDS endpoint and S3 bucket from Terraform output
+      # Resolve the bucket name from Terraform state rather than hardcoding it,
+      # so it stays in sync with the account-ID-suffixed name Terraform created.
+      - name: Resolve S3 bucket from Terraform output
         working-directory: infra/envs/sandbox
         run: |
           terraform init -input=false
-          echo "RDS_ENDPOINT=$(terraform output -raw rds_endpoint)" >> "$GITHUB_ENV"
           echo "SCHEMA_BUCKET=$(terraform output -raw s3_bucket_name)" >> "$GITHUB_ENV"
 
       - name: Upload schema.sql, seed script, and sample images to S3
@@ -52,38 +61,68 @@ jobs:
           aws s3 sync event-ticketing/uploads/ "s3://${{ env.SCHEMA_BUCKET }}/uploads/" \
             --exclude "index.html"
 
-      - name: Read DB credentials from SSM Parameter Store and import schema into RDS
+      - name: Resolve a running app instance from the ASG
+        run: |
+          set -euo pipefail
+          INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "${{ env.ASG_NAME }}" \
+            --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`]|[0].InstanceId' \
+            --output text)
+
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+            echo "No InService instance found in ${{ env.ASG_NAME }}. Is the ASG scaled up and healthy?" >&2
+            exit 1
+          fi
+
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "Targeting instance $INSTANCE_ID"
+
+      - name: Run seed-db.sh on the instance via SSM
         run: |
           set -euo pipefail
 
-          echo "Fetching DB credentials from SSM Parameter Store..."
-          aws ssm get-parameter \
-            --name assignment-db-credentials \
-            --with-decryption \
-            --query Parameter.Value \
-            --output text > db-creds.json
+          SCHEMA_URI="s3://${{ env.SCHEMA_BUCKET }}/${{ env.SCHEMA_KEY }}"
+          SCRIPT_URI="s3://${{ env.SCHEMA_BUCKET }}/${{ env.SCRIPT_KEY }}"
 
-          python - <<'PY'
-          import json
-          import subprocess
-          
-          with open('db-creds.json', 'r', encoding='utf-8') as f:
-              data = json.load(f)
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "db-init: seed event_ticketing_db from schema.sql" \
+            --parameters "{\"commands\":[\
+              \"aws s3 cp '$SCRIPT_URI' /tmp/seed-db.sh --region ${{ env.AWS_REGION }}\",\
+              \"chmod +x /tmp/seed-db.sh\",\
+              \"AWS_REGION=${{ env.AWS_REGION }} /tmp/seed-db.sh '$SCHEMA_URI' '${{ env.SCHEMA_BUCKET }}'\"\
+            ]}" \
+            --query "Command.CommandId" --output text)
 
-          host = data['host']
-          user = data['username']
-          password = data['password']
-          dbname = data['dbname']
+          echo "SSM command $COMMAND_ID dispatched to $INSTANCE_ID, waiting for result..."
 
-          with open('/tmp/schema.sql', 'w', encoding='utf-8') as f:
-              f.write(open('event-ticketing/schema.sql', 'r', encoding='utf-8').read())
+          STATUS="Pending"
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
 
-          with open('/tmp/schema.sql', 'r', encoding='utf-8') as schema_file:
-              subprocess.run(
-                  ["mysql", "-h", host, "-u", user, f"-p{password}", dbname],
-                  stdin=schema_file,
-                  check=True,
-              )
+            if [ "$STATUS" != "Pending" ] && [ "$STATUS" != "InProgress" ]; then
+              break
+            fi
+            sleep 3
+          done
 
-          print('Schema imported into RDS successfully.')
-          PY
+          echo "Final status: $STATUS"
+          echo "--- stdout ---"
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardOutputContent" --output text
+          echo "--- stderr ---"
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardErrorContent" --output text
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "SSM command did not succeed (status: $STATUS)." >&2
+            exit 1
+          fi
